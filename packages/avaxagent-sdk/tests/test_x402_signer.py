@@ -1,0 +1,671 @@
+"""Tests for avaxagent.x402.X402Signer."""
+
+from __future__ import annotations
+
+import time
+
+import pytest
+
+from avaxagent import EVMWalletProvider
+from avaxagent.networks import AVALANCHE_MAINNET_CHAIN_ID, get_address
+from avaxagent.x402 import (
+    SessionBudgetTracker,
+    X402AmountExceededError,
+    X402BudgetExhaustedError,
+    X402PolicyError,
+    X402RecipientMismatchError,
+    X402Signer,
+)
+from avaxagent.x402.assets import resolve_expected_eip3009_route
+
+PW = "test-secure-password-123"
+PK = "0x" + "a" * 64
+
+# Circle USDC is the default x402 token on Avalanche; EURC is the second
+# catalog asset and plays the "substituted token" role in route-binding tests.
+USDC_MAINNET = get_address(AVALANCHE_MAINNET_CHAIN_ID).payment_token
+EURC_MAINNET = "0xC891EB4cbdEFf6e073e859e987815Ed1505c2ACD"
+
+USDC_EIP3009_ROUTE = resolve_expected_eip3009_route("eip155:43114", "USDC")
+EURC_EIP3009_ROUTE = resolve_expected_eip3009_route("eip155:43114", "EURC")
+
+EIP712DOMAIN_FIELDS = [
+    {"name": "name", "type": "string"},
+    {"name": "version", "type": "string"},
+    {"name": "chainId", "type": "uint256"},
+    {"name": "verifyingContract", "type": "address"},
+]
+TWA_FIELDS = [
+    {"name": "from", "type": "address"},
+    {"name": "to", "type": "address"},
+    {"name": "value", "type": "uint256"},
+    {"name": "validAfter", "type": "uint256"},
+    {"name": "validBefore", "type": "uint256"},
+    {"name": "nonce", "type": "bytes32"},
+]
+
+
+@pytest.fixture
+def wallet(tmp_path):
+    return EVMWalletProvider(
+        password=PW,
+        private_key=PK,
+        wallets_dir=tmp_path / "wallets",
+    )
+
+
+@pytest.fixture
+def signer(wallet):
+    return X402Signer(
+        wallet,
+        max_value_per_call={USDC_MAINNET: 1_000_000},
+        session_budget={USDC_MAINNET: 5_000_000},
+    )
+
+
+def _payload(*, to=None, value=500_000, from_addr=None):
+    now = int(time.time())
+    return {
+        "domain": {
+            "name": "USD Coin",
+            "version": "2",
+            "chainId": AVALANCHE_MAINNET_CHAIN_ID,
+            "verifyingContract": USDC_MAINNET,
+        },
+        "types": {"EIP712Domain": EIP712DOMAIN_FIELDS, "TransferWithAuthorization": TWA_FIELDS},
+        "message": {
+            "from": from_addr or ("0x" + "a" * 40),
+            "to": to or ("0x" + "b" * 40),
+            "value": value,
+            "validAfter": now - 60,
+            "validBefore": now + 60,
+            "nonce": "0x" + "c" * 64,
+        },
+        "expected_route": USDC_EIP3009_ROUTE,
+    }
+
+
+# ── Catalog EIP-3009 route binding ──────────────────────────────────────
+
+
+def test_rejects_eurc_substituted_for_caller_selected_usdc_route_before_signing(signer):
+    sign_calls = 0
+
+    class NeverSign:
+        address = signer.wallet_address
+
+        def sign_typed_data(self, domain, types, message):
+            nonlocal sign_calls
+            sign_calls += 1
+            raise AssertionError("wallet must not be called for a rejected route")
+
+    route_signer = X402Signer(NeverSign())
+    p = _payload(from_addr=route_signer.wallet_address)
+    p["domain"].update(
+        name=EURC_EIP3009_ROUTE.name,
+        verifyingContract=EURC_MAINNET,
+    )
+    p["expected_route"] = USDC_EIP3009_ROUTE
+    with pytest.raises(X402PolicyError, match="expected EIP-3009 route"):
+        route_signer.sign_payment(**p, expected_to=p["message"]["to"])
+    assert route_signer.budget.spent(USDC_MAINNET) == 0
+    assert sign_calls == 0
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (("name", "Euro Coin"), ("version", "1")),
+)
+def test_rejects_wrong_eip712_name_or_version_before_signing(signer, field, value):
+    p = _payload(from_addr=signer.wallet_address)
+    p["domain"][field] = value
+    p["expected_route"] = USDC_EIP3009_ROUTE
+    with pytest.raises(X402PolicyError, match="expected EIP-3009 route"):
+        signer.sign_payment(**p, expected_to=p["message"]["to"])
+    assert signer.budget.spent(USDC_MAINNET) == 0
+
+
+@pytest.mark.parametrize(
+    "variant",
+    (
+        "extra_salt",
+        "missing_version",
+        "expanded_salt_schema",
+        "wrong_schema_field_type",
+        "reordered_schema",
+        "duplicated_schema_field",
+    ),
+)
+def test_rejects_noncanonical_domain_before_budget_or_wallet_signing(signer, variant):
+    sign_calls = 0
+
+    class TrackingWallet:
+        address = signer.wallet_address
+
+        def sign_typed_data(self, domain, types, message):
+            nonlocal sign_calls
+            sign_calls += 1
+            return {"signature": "0x"}
+
+    tracking_signer = X402Signer(TrackingWallet())
+    p = _payload(from_addr=tracking_signer.wallet_address)
+    if variant == "extra_salt":
+        p["domain"]["salt"] = "0x" + "0" * 64
+    elif variant == "missing_version":
+        del p["domain"]["version"]
+    elif variant == "expanded_salt_schema":
+        p["domain"]["salt"] = "0x" + "0" * 64
+        p["types"]["EIP712Domain"] = [
+            *EIP712DOMAIN_FIELDS,
+            {"name": "salt", "type": "bytes32"},
+        ]
+    elif variant == "wrong_schema_field_type":
+        p["types"]["EIP712Domain"] = [
+            {"name": "name", "type": "bytes32"},
+            *EIP712DOMAIN_FIELDS[1:],
+        ]
+    elif variant == "reordered_schema":
+        p["types"]["EIP712Domain"] = [
+            EIP712DOMAIN_FIELDS[1],
+            EIP712DOMAIN_FIELDS[0],
+            *EIP712DOMAIN_FIELDS[2:],
+        ]
+    else:
+        p["types"]["EIP712Domain"] = [
+            EIP712DOMAIN_FIELDS[0],
+            EIP712DOMAIN_FIELDS[0],
+            *EIP712DOMAIN_FIELDS[1:3],
+        ]
+
+    try:
+        tracking_signer.sign_payment(**p, expected_to=p["message"]["to"])
+    except X402PolicyError:
+        pass
+
+    assert tracking_signer.budget.spent(USDC_MAINNET) == 0
+    assert sign_calls == 0
+
+
+def test_rejects_unknown_fuji_placeholder_route_before_signing(signer):
+    p = _payload(from_addr=signer.wallet_address)
+    from dataclasses import replace
+
+    placeholder = replace(
+        USDC_EIP3009_ROUTE,
+        network="eip155:43113",
+        chain_id=43113,
+        asset_id="FUJI_USDT",  # type: ignore[arg-type]
+        address="0x0000000000000000000000000000000000000000",
+    )
+    p["expected_route"] = placeholder
+    with pytest.raises(X402PolicyError, match="expected EIP-3009 route"):
+        signer.sign_payment(**p, expected_to=p["message"]["to"])
+    assert signer.budget.spent(USDC_MAINNET) == 0
+
+
+# ── Happy path ───────────────────────────────────────────────────────────
+
+
+def test_sign_payment_succeeds_for_usdc_within_budget(signer):
+    p = _payload(from_addr=signer.wallet_address)
+    signed = signer.sign_payment(**p, expected_to=p["message"]["to"])
+    assert "signature" in signed
+    assert signer.budget.spent(USDC_MAINNET) == p["message"]["value"]
+
+
+def test_missing_verifying_contract_uses_x402_error_contract(signer):
+    p = _payload(from_addr=signer.wallet_address)
+    del p["domain"]["verifyingContract"]
+    with pytest.raises(X402PolicyError, match="missing verifyingContract"):
+        signer.sign_payment(**p, expected_to=p["message"]["to"])
+
+
+def test_invalid_verifying_contract_uses_x402_error_contract(signer):
+    p = _payload(from_addr=signer.wallet_address)
+    p["domain"]["verifyingContract"] = "not-an-address"
+    with pytest.raises(X402PolicyError, match="invalid or missing verifyingContract"):
+        signer.sign_payment(**p, expected_to=p["message"]["to"])
+
+
+# ── Recipient mismatch ───────────────────────────────────────────────────
+
+
+def test_rejects_when_expected_to_differs(signer):
+    p = _payload(to="0x" + "b" * 40)
+    with pytest.raises(X402RecipientMismatchError, match="does not match"):
+        signer.sign_payment(**p, expected_to="0x" + "9" * 40)
+    # Budget untouched
+    assert signer.budget.spent(USDC_MAINNET) == 0
+
+
+def test_recipient_check_is_case_insensitive(signer):
+    """0xAB... and 0xab... must compare equal — checksum casing varies in the wild."""
+    p = _payload(
+        to="0xaAaAaAaAaAaAaAaAaAaAaAaAaAaAaAaAaAaAaAaA",
+        from_addr=signer.wallet_address,
+    )
+    signed = signer.sign_payment(**p, expected_to="0xAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")
+    assert "signature" in signed
+
+
+def test_rejects_when_message_to_missing(signer):
+    p = _payload()
+    del p["message"]["to"]
+    with pytest.raises(X402RecipientMismatchError, match="missing or not an address"):
+        signer.sign_payment(**p, expected_to="0x" + "b" * 40)
+
+
+def test_rejects_matching_malformed_recipient_addresses_before_budget_or_wallet_signing(signer):
+    sign_calls = 0
+
+    class TrackingWallet:
+        address = signer.wallet_address
+
+        def sign_typed_data(self, domain, types, message):
+            nonlocal sign_calls
+            sign_calls += 1
+            return {"signature": "0x"}
+
+    tracking_signer = X402Signer(TrackingWallet())
+    p = _payload(from_addr=tracking_signer.wallet_address)
+    p["message"]["to"] = "not-an-address"
+
+    try:
+        tracking_signer.sign_payment(**p, expected_to="not-an-address")
+    except X402RecipientMismatchError:
+        pass
+
+    assert tracking_signer.budget.spent(USDC_MAINNET) == 0
+    assert sign_calls == 0
+
+
+# ── Signer binding (message['from']) ─────────────────────────────────────
+
+
+def test_rejects_forged_from(signer):
+    """message['from'] != wallet address must be refused before budget reserve."""
+    p = _payload(from_addr="0x" + "d" * 40)  # not the wallet
+    with pytest.raises(X402RecipientMismatchError, match="does not match wallet"):
+        signer.sign_payment(**p, expected_to=p["message"]["to"])
+    assert signer.budget.spent(USDC_MAINNET) == 0
+
+
+def test_rejects_when_message_from_missing(signer):
+    p = _payload(from_addr=signer.wallet_address)
+    del p["message"]["from"]
+    with pytest.raises(X402RecipientMismatchError, match="missing or not an address"):
+        signer.sign_payment(**p, expected_to=p["message"]["to"])
+    assert signer.budget.spent(USDC_MAINNET) == 0
+
+
+# ── Per-call value cap ───────────────────────────────────────────────────
+
+
+def test_rejects_when_value_exceeds_max_per_call(signer):
+    p = _payload(value=2_000_000)  # cap is 1_000_000
+    with pytest.raises(X402AmountExceededError, match="exceeds max_value_per_call"):
+        signer.sign_payment(**p, expected_to=p["message"]["to"])
+    assert signer.budget.spent(USDC_MAINNET) == 0
+
+
+# ── Negative value (SRC-1314) ────────────────────────────────────────────
+# The per-call cap and the session budget are both one-sided comparisons
+# (`value > cap`, `cur + amt > cap`), valid only under a `value >= 0`
+# precondition that nothing used to assert. A negative value slipped past
+# both and drove the session counter negative, neutralising the budget.
+
+
+def test_negative_value_is_rejected(signer):
+    p = _payload(value=-1)
+    with pytest.raises(X402AmountExceededError, match="non-negative"):
+        signer.sign_payment(**p, expected_to=p["message"]["to"])
+    assert signer.budget.spent(USDC_MAINNET) == 0
+
+
+def test_huge_negative_value_is_rejected(signer):
+    """The exploit's magnitude: large enough to swamp the cap for a session."""
+    p = _payload(value=-(10**30))
+    with pytest.raises(X402AmountExceededError, match="non-negative"):
+        signer.sign_payment(**p, expected_to=p["message"]["to"])
+    assert signer.budget.spent(USDC_MAINNET) == 0
+
+
+def test_negative_value_via_int256_schema_is_rejected(signer):
+    """The full exploit chain: a poisoned `types` dict declaring `value` as
+    int256 (so eth_abi will happily encode a negative) plus a negative value.
+
+    Both defects had to align — under the canonical uint256 schema eth_abi
+    raises and the rollback path restores the counter, so the corruption was
+    transient. int256 made it persistent *and* produced a real signature.
+    """
+    p = _payload(value=-(10**30), from_addr=signer.wallet_address)
+    p["types"] = {
+        "EIP712Domain": EIP712DOMAIN_FIELDS,
+        "TransferWithAuthorization": [
+            {**f, "type": "int256"} if f["name"] == "value" else f for f in TWA_FIELDS
+        ],
+    }
+    with pytest.raises((X402AmountExceededError, X402PolicyError)):
+        signer.sign_payment(**p, expected_to=p["message"]["to"])
+    assert signer.budget.spent(USDC_MAINNET) == 0
+
+
+def test_int256_schema_rejected_through_the_x402_path(signer):
+    """Fix C standing alone: a positive, in-cap value with a poisoned schema.
+
+    The amount guards have nothing to object to here, so this only passes if
+    the field shape is pinned (X402Signer, then the wallet's SigningPolicy),
+    and the budget must be left untouched.
+    """
+    p = _payload(value=500_000, from_addr=signer.wallet_address)
+    p["types"] = {
+        "EIP712Domain": EIP712DOMAIN_FIELDS,
+        "TransferWithAuthorization": [
+            {**f, "type": "int256"} if f["name"] == "value" else f for f in TWA_FIELDS
+        ],
+    }
+    with pytest.raises(X402PolicyError, match="canonical EIP-3009 field shape"):
+        signer.sign_payment(**p, expected_to=p["message"]["to"])
+    assert signer.budget.spent(USDC_MAINNET) == 0
+
+
+def test_failed_poison_does_not_authorise_overspend(signer):
+    """The consequence under test, stated directly: a rejected poison attempt
+    must leave the advertised session cap fully enforced.
+    """
+    p = _payload(value=-(10**30), from_addr=signer.wallet_address)
+    with pytest.raises(X402AmountExceededError):
+        signer.sign_payment(**p, expected_to=p["message"]["to"])
+
+    # 5 x 1_000_000 exactly exhausts the 5_000_000 session budget.
+    for _ in range(5):
+        q = _payload(value=1_000_000, from_addr=signer.wallet_address)
+        signer.sign_payment(**q, expected_to=q["message"]["to"])
+    assert signer.budget.spent(USDC_MAINNET) == 5_000_000
+
+    r = _payload(value=1, from_addr=signer.wallet_address)
+    with pytest.raises(X402BudgetExhaustedError):
+        signer.sign_payment(**r, expected_to=r["message"]["to"])
+
+
+# ── SessionBudgetTracker negative-amount guard (SRC-1314) ────────────────
+# The "counter must never go negative" invariant was installed on rollback()
+# (where it is merely defensive) but not on the increment paths (where it is
+# load-bearing). Assert it directly on the tracker, independent of the signer.
+
+
+def test_tracker_reserve_rejects_negative_amount():
+    t = SessionBudgetTracker({USDC_MAINNET: 1_000})
+    with pytest.raises(X402BudgetExhaustedError, match="non-negative"):
+        t.reserve(USDC_MAINNET, -1)
+    assert t.spent(USDC_MAINNET) == 0
+
+
+def test_tracker_does_not_expose_race_unsafe_legacy_methods():
+    t = SessionBudgetTracker({USDC_MAINNET: 1_000})
+    assert not hasattr(t, "would_exceed")
+    assert not hasattr(t, "commit")
+
+
+def test_tracker_reserve_rejects_negative_even_without_a_cap():
+    """An untracked token has no cap, but the counter must still not go
+    negative — a later extend()/cap change would otherwise inherit the debt.
+    """
+    t = SessionBudgetTracker(None)
+    with pytest.raises(X402BudgetExhaustedError, match="non-negative"):
+        t.reserve(USDC_MAINNET, -1)
+    assert t.spent(USDC_MAINNET) == 0
+
+
+# ── Session budget ──────────────────────────────────────────────────────
+
+
+def test_session_budget_accumulates_across_calls(signer):
+    """Five calls of 500k each = 2.5M; budget is 5M, all should succeed."""
+    for _ in range(5):
+        p = _payload(value=500_000, from_addr=signer.wallet_address)
+        signer.sign_payment(**p, expected_to=p["message"]["to"])
+    assert signer.budget.spent(USDC_MAINNET) == 2_500_000
+
+
+def test_session_budget_blocks_next_call_when_exhausted(signer):
+    """Budget 5M, per-call 1M. Spend 4M then try 1.5M (per-call would also
+    fail but budget should trigger first only if budget < per-call)."""
+    # First spend 5M cumulative (within both caps)
+    for _ in range(5):
+        p = _payload(value=1_000_000, from_addr=signer.wallet_address)
+        signer.sign_payment(**p, expected_to=p["message"]["to"])
+    assert signer.budget.spent(USDC_MAINNET) == 5_000_000
+    # Sixth call: even 1 wei exceeds budget
+    p = _payload(value=1, from_addr=signer.wallet_address)
+    with pytest.raises(X402BudgetExhaustedError, match="session budget"):
+        signer.sign_payment(**p, expected_to=p["message"]["to"])
+
+
+def test_budget_not_consumed_when_underlying_wallet_rejects(wallet, tmp_path):
+    """If wallet's SigningPolicy raises (e.g. unknown verifyingContract),
+    budget tracker must remain at zero — failed signs don't deduct."""
+    signer = X402Signer(
+        wallet,
+        max_value_per_call={"0x" + "1" * 40: 1_000_000},
+        session_budget={"0x" + "1" * 40: 5_000_000},
+    )
+    p = _payload(value=500_000, from_addr=signer.wallet_address)
+    p["domain"]["verifyingContract"] = "0x" + "1" * 40  # not in wallet allowlist
+    with pytest.raises(X402PolicyError):
+        signer.sign_payment(**p, expected_to=p["message"]["to"])
+    from web3 import Web3
+
+    assert signer.budget.spent(Web3.to_checksum_address("0x" + "1" * 40)) == 0
+
+
+# ── Non-EIP-3009 rejection ──────────────────────────────────────────────
+
+
+def test_rejects_permit_primary_type_before_budget_or_wallet_signing(wallet, tmp_path):
+    """Only EIP-3009 may pass the catalog-bound signer entrypoint."""
+    signer = X402Signer(
+        wallet,
+        max_value_per_call={USDC_MAINNET: 1_000_000},
+    )
+    permit_payload = {
+        "domain": {
+            "name": "USD Coin",
+            "version": "2",
+            "chainId": AVALANCHE_MAINNET_CHAIN_ID,
+            "verifyingContract": USDC_MAINNET,
+        },
+        "types": {
+            "EIP712Domain": EIP712DOMAIN_FIELDS,
+            "Permit": [
+                {"name": "owner", "type": "address"},
+                {"name": "spender", "type": "address"},
+                {"name": "value", "type": "uint256"},
+                {"name": "nonce", "type": "uint256"},
+                {"name": "deadline", "type": "uint256"},
+            ],
+        },
+        "message": {
+            "owner": "0x" + "a" * 40,
+            "spender": "0x" + "b" * 40,
+            # X402Signer needs message['to'] and ['from'] to pass the recipient
+            # and signer-binding checks; for this propagation test we route them
+            # even though the Permit struct has neither — caller must supply an
+            # expected_to that matches and a from equal to the wallet.
+            "to": "0x" + "b" * 40,
+            "from": signer.wallet_address,
+            "value": 500_000,
+            "nonce": 0,
+            "deadline": 2_000_000_000,
+        },
+        "expected_route": USDC_EIP3009_ROUTE,
+    }
+    with pytest.raises(X402PolicyError, match="expected EIP-3009 route"):
+        signer.sign_payment(**permit_payload, expected_to="0x" + "b" * 40)
+    assert signer.budget.spent(USDC_MAINNET) == 0
+
+
+# ── Concurrency regression (v0.4.1 / PR #34 review) ──────────────────────
+
+
+def test_budget_atomic_under_concurrent_signs(wallet):
+    """Two threads racing sign_payment with value==full-cap must result in
+    exactly one signed payment, not two. Without atomic reserve/rollback,
+    both threads could otherwise observe spent=0 and sign, producing
+    spent=2*cap. This test asserts the atomic reserve/rollback path.
+    """
+    import threading
+    import time
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    from avaxagent.x402 import X402BudgetExhaustedError, X402Signer
+
+    # Slow the wallet sign so any non-atomic check would lose the race —
+    # without this the OS may serialise the two threads naturally.
+    real_sign = wallet.sign_typed_data
+    sign_calls: list[int] = []
+    sign_lock = threading.Lock()
+
+    def slow_sign(domain, types, message):
+        time.sleep(0.05)  # widen the race window
+        result = real_sign(domain, types, message)
+        with sign_lock:
+            sign_calls.append(1)
+        return result
+
+    wallet.sign_typed_data = slow_sign  # type: ignore[method-assign]
+
+    cap = 1_000_000
+    signer = X402Signer(
+        wallet,
+        max_value_per_call={USDC_MAINNET: cap},
+        session_budget={USDC_MAINNET: cap},  # one call fits exactly
+    )
+
+    # Start barrier syncs both threads so they enter sign_payment together
+    # (and therefore both contend on reserve()).
+    start_barrier = threading.Barrier(2)
+
+    def attempt() -> tuple[str, object]:
+        start_barrier.wait()
+        p = _payload(value=cap, from_addr=signer.wallet_address)
+        try:
+            res = signer.sign_payment(**p, expected_to=p["message"]["to"])
+            return ("signed", res)
+        except X402BudgetExhaustedError as e:
+            return ("rejected", e)
+
+    with ThreadPoolExecutor(max_workers=2) as ex:
+        futures = [ex.submit(attempt) for _ in range(2)]
+        outcomes = [f.result() for f in as_completed(futures)]
+
+    signed = [o for o in outcomes if o[0] == "signed"]
+    rejected = [o for o in outcomes if o[0] == "rejected"]
+    assert len(signed) == 1, f"exactly one sign expected; got {[o[0] for o in outcomes]}"
+    assert len(rejected) == 1
+    # Spent counter never exceeds cap
+    assert signer.budget.spent(USDC_MAINNET) == cap
+    # The underlying wallet was invoked exactly once — the rejected thread
+    # short-circuited at reserve() and never reached sign_typed_data.
+    assert len(sign_calls) == 1
+
+
+def test_budget_rolls_back_when_wallet_raises_nonpolicy_exception(wallet):
+    """Failures other than PolicyViolation must also release the reservation
+    (caller could see RuntimeError / network error / KeyboardInterrupt)."""
+    from avaxagent.x402 import X402Signer
+
+    class Boom(RuntimeError):
+        pass
+
+    def explode(domain, types, message):
+        raise Boom("transport failed")
+
+    wallet.sign_typed_data = explode  # type: ignore[method-assign]
+
+    signer = X402Signer(
+        wallet,
+        max_value_per_call={USDC_MAINNET: 1_000_000},
+        session_budget={USDC_MAINNET: 1_000_000},
+    )
+    p = _payload(value=500_000, from_addr=signer.wallet_address)
+    with pytest.raises(Boom):
+        signer.sign_payment(**p, expected_to=p["message"]["to"])
+    # Reservation was released
+    assert signer.budget.spent(USDC_MAINNET) == 0
+
+
+# ── Composition-time capability gate (Phase 1b) ──────────────────────────
+
+
+def test_wallet_without_typed_data_rejected_at_construction():
+    """A wallet whose supports() reports no sign.typed_data is refused in
+    X402Signer.__init__ — before any payment flow."""
+    from avaxagent.wallets import UnsupportedWalletOperation, WalletProvider
+
+    class MessageOnly(WalletProvider):
+        @property
+        def address(self) -> str:
+            return "0x" + "11" * 20
+
+        def sign_message(self, message):
+            return {"signature": "0x" + "00" * 65}
+
+    with pytest.raises(UnsupportedWalletOperation, match="delegated x402 payer"):
+        X402Signer(MessageOnly())
+
+
+@pytest.mark.parametrize(
+    "fields",
+    [
+        [{**f, "type": "int256"} if f["name"] == "value" else f for f in TWA_FIELDS],
+        [TWA_FIELDS[1], TWA_FIELDS[0], *TWA_FIELDS[2:]],  # from/to swapped
+        [*TWA_FIELDS, {"name": "memo", "type": "string"}],
+    ],
+)
+def test_non_canonical_eip3009_shape_is_refused_before_a_duck_typed_wallet(fields):
+    """A duck-typed wallet runs no SigningPolicy, so X402Signer pins the
+    TransferWithAuthorization field shape itself (SRC-1314 / SRC-1485)."""
+    calls = []
+
+    class DuckSigner:
+        address = "0x" + "a" * 40
+
+        def sign_typed_data(self, domain, types, message):
+            calls.append(types)
+            return {"signature": b"\x01" * 65}
+
+    signer = X402Signer(
+        DuckSigner(),
+        max_value_per_call={USDC_MAINNET: 1_000_000},
+        session_budget={USDC_MAINNET: 5_000_000},
+    )
+    p = _payload(value=500_000, from_addr=signer.wallet_address)
+    p["types"] = {"EIP712Domain": EIP712DOMAIN_FIELDS, "TransferWithAuthorization": fields}
+
+    with pytest.raises(X402PolicyError, match="canonical EIP-3009 field shape"):
+        signer.sign_payment(**p, expected_to=p["message"]["to"])
+
+    assert calls == []
+    assert signer.budget.spent(USDC_MAINNET) == 0
+
+
+def test_duck_typed_signer_without_supports_constructs_and_signs():
+    """A plain object exposing only address + sign_typed_data (no supports())
+    passes the gate — the narrow TypedDataSigner protocol use case."""
+
+    class DuckSigner:
+        address = "0x" + "a" * 40
+
+        def sign_typed_data(self, domain, types, message):
+            return {"signature": b"\x01" * 65}
+
+    signer = X402Signer(
+        DuckSigner(),
+        max_value_per_call={USDC_MAINNET: 1_000_000},
+        session_budget={USDC_MAINNET: 5_000_000},
+    )
+    p = _payload(from_addr=signer.wallet_address)
+    signed = signer.sign_payment(**p, expected_to=p["message"]["to"])
+    assert "signature" in signed
+    assert signer.budget.spent(USDC_MAINNET) == p["message"]["value"]

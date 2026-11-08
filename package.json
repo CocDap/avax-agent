@@ -1,0 +1,13 @@
+{
+  "name": "avaxagent-studio",
+  "private": true,
+  "packageManager": "pnpm@10.26.1",
+  "scripts": {
+    "dev:web": "pnpm --filter @avaxagent-studio/frontend dev",
+    "build:web": "pnpm --filter @avaxagent-studio/frontend build",
+    "lint:web": "pnpm --filter @avaxagent-studio/frontend lint"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": ["esbuild"]
+  }
+}

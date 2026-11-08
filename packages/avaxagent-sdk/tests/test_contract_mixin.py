@@ -1,0 +1,287 @@
+"""Tests for ContractClientMixin._send_tx gas-limit estimation and
+``_execute_intent`` (the intent-seam write path).
+
+A hardcoded 2M gas limit makes nodes demand ``balance >= 2M * gasPrice``
+(e.g. 2M * 25 gwei = 0.05 AVAX) upfront while typical writes burn 50-150k gas. ``gas=None``
+now estimates on-chain with a 20% buffer (mirroring erc8004) and only
+falls back to ``DEFAULT_GAS_FALLBACK`` when estimation is unavailable.
+"""
+
+from unittest.mock import MagicMock, patch
+
+import pytest
+from web3.exceptions import ContractLogicError
+
+from avaxagent.core.contract_mixin import DEFAULT_GAS_FALLBACK, ContractClientMixin
+from avaxagent.core.nonce_manager import NonceManager
+from avaxagent.wallets.intents import ExecutionContext, Intent
+from tests.conftest import FAKE_ADDRESS
+
+
+class _FakeClient(ContractClientMixin):
+    def __init__(self, w3, wallet_provider):
+        self.w3 = w3
+        self._wallet_provider = wallet_provider
+        self._account = FAKE_ADDRESS
+
+
+@pytest.fixture(autouse=True)
+def _clear_nonce_singletons():
+    NonceManager._clear_all()
+    yield
+    NonceManager._clear_all()
+
+
+@pytest.fixture
+def client(mock_web3):
+    wallet = MagicMock()
+    wallet.address = FAKE_ADDRESS
+    wallet.sign_transaction.return_value = {"rawTransaction": b"\x00" * 32}
+    return _FakeClient(mock_web3, wallet)
+
+
+def _make_fn(estimate=100_000):
+    fn = MagicMock()
+    fn.estimate_gas.return_value = estimate
+    fn.build_transaction.side_effect = lambda params: {
+        **params,
+        "to": "0x" + "11" * 20,
+        "data": "0x",
+    }
+    return fn
+
+
+def _built_gas(fn) -> int:
+    return fn.build_transaction.call_args[0][0]["gas"]
+
+
+class TestGasEstimation:
+    def test_estimates_with_20pct_buffer(self, client):
+        fn = _make_fn(estimate=100_000)
+        result = client._send_tx(fn)
+        assert result["status"] == 1
+        fn.estimate_gas.assert_called_once_with({"from": FAKE_ADDRESS, "value": 0})
+        assert _built_gas(fn) == 120_000
+
+    def test_estimate_includes_value(self, client):
+        fn = _make_fn()
+        client._send_tx(fn, value=123)
+        fn.estimate_gas.assert_called_once_with({"from": FAKE_ADDRESS, "value": 123})
+
+    def test_explicit_gas_skips_estimation(self, client):
+        fn = _make_fn()
+        client._send_tx(fn, gas=500_000)
+        fn.estimate_gas.assert_not_called()
+        assert _built_gas(fn) == 500_000
+
+    def test_transport_error_falls_back_to_default(self, client):
+        fn = _make_fn()
+        fn.estimate_gas.side_effect = ConnectionError("rpc down")
+        result = client._send_tx(fn)
+        assert result["status"] == 1
+        assert _built_gas(fn) == DEFAULT_GAS_FALLBACK
+
+    def test_genuine_revert_propagates(self, client):
+        fn = _make_fn()
+        fn.estimate_gas.side_effect = ContractLogicError(
+            "execution reverted: NotProvider"
+        )
+        with pytest.raises(RuntimeError, match="Transaction would revert"):
+            client._send_tx(fn)
+        fn.build_transaction.assert_not_called()
+
+    def test_opaque_revert_falls_back_to_default(self, client):
+        # Some nodes return no revert data; str() of the error ends with
+        # ", '0x')" — the same escape hatch the pre-flight uses.
+        fn = _make_fn()
+        fn.estimate_gas.side_effect = ContractLogicError(
+            ("execution reverted", "0x")
+        )
+        result = client._send_tx(fn)
+        assert result["status"] == 1
+        assert _built_gas(fn) == DEFAULT_GAS_FALLBACK
+
+    def test_skip_preflight_skips_estimation(self, client):
+        fn = _make_fn()
+        client._send_tx(fn, skip_preflight=True)
+        fn.estimate_gas.assert_not_called()
+        assert _built_gas(fn) == DEFAULT_GAS_FALLBACK
+
+
+class TestExecuteIntent:
+    """``_execute_intent`` — wallet-chosen executor, built lazily, cached."""
+
+    def test_read_only_client_raises(self, mock_web3):
+        client = _FakeClient(mock_web3, wallet_provider=None)
+        with pytest.raises(RuntimeError, match="read-only"):
+            client._execute_intent(Intent(name="x.y", call=MagicMock()))
+
+    def test_executor_built_via_make_executor_with_execution_context(
+        self, client, mock_web3
+    ):
+        executor = MagicMock()
+        executor.execute.return_value = {"transactionHash": "0xabc", "receipt": None}
+        client._wallet_provider.make_executor.return_value = executor
+
+        intent = Intent(name="x.y", call=MagicMock())
+        result = client._execute_intent(intent)
+
+        assert result == {"transactionHash": "0xabc", "receipt": None}
+        client._wallet_provider.make_executor.assert_called_once()
+        (context,), _ = client._wallet_provider.make_executor.call_args
+        assert isinstance(context, ExecutionContext)
+        assert context.web3 is mock_web3
+        executor.execute.assert_called_once_with(intent)
+
+    def test_executor_cached_across_writes(self, client):
+        executor = MagicMock()
+        executor.execute.return_value = {"transactionHash": "0xabc", "receipt": None}
+        client._wallet_provider.make_executor.return_value = executor
+
+        client._execute_intent(Intent(name="x.y", call=MagicMock()))
+        client._execute_intent(Intent(name="x.z", call=MagicMock()))
+
+        client._wallet_provider.make_executor.assert_called_once()
+        assert executor.execute.call_count == 2
+
+
+class TestGasPriceFloor:
+    """Per-chain gas-price floor (BUG-12) on the ``_send_tx`` write path."""
+
+    def test_tracks_low_network_price_on_fuji(self, client, mock_web3):
+        mock_web3.eth.chain_id = 43113
+        mock_web3.eth.gas_price = 100  # Avalanche floor is 1 wei → 100 * 1.2
+        fn = _make_fn()
+        client._send_tx(fn)
+        assert fn.build_transaction.call_args[0][0]["gasPrice"] == 120
+
+    def test_floors_at_default_on_unknown_chain(self, client, mock_web3):
+        mock_web3.eth.chain_id = 12345
+        mock_web3.eth.gas_price = 100  # absurdly low → 0.1 gwei default floor
+        fn = _make_fn()
+        client._send_tx(fn)
+        assert fn.build_transaction.call_args[0][0]["gasPrice"] == 100_000_000
+
+    def test_uses_network_price_when_above_floor(self, client, mock_web3):
+        mock_web3.eth.chain_id = 43113
+        mock_web3.eth.gas_price = 5_000_000_000  # 5 Gwei
+        fn = _make_fn()
+        client._send_tx(fn)
+        assert fn.build_transaction.call_args[0][0]["gasPrice"] == 6_000_000_000
+
+
+class TestReceiptTimeoutPassed:
+    """``_send_tx`` must wait with the shared default receipt timeout (BUG-13)."""
+
+    def test_send_tx_passes_default_timeout(self, client, mock_web3):
+        fn = _make_fn()
+        client._send_tx(fn)
+        _, kwargs = mock_web3.eth.wait_for_transaction_receipt.call_args
+        assert kwargs["timeout"] == 300
+
+    def test_send_tx_honors_runtime_setter(self, client, mock_web3):
+        from avaxagent import set_default_receipt_timeout
+
+        set_default_receipt_timeout(456)
+        fn = _make_fn()
+        client._send_tx(fn)
+        _, kwargs = mock_web3.eth.wait_for_transaction_receipt.call_args
+        assert kwargs["timeout"] == 456
+
+
+class TestSendTxReceiptTimeoutPending:
+    """A timed-out receipt on the legacy ``_send_tx`` path is pending, not fatal,
+    and is never retried into a double-broadcast (parity with LocalExecutor)."""
+
+    def test_timeout_raises_pending_with_tx_hash(self, client, mock_web3):
+        from web3.exceptions import TimeExhausted
+
+        from avaxagent import TransactionPendingError
+        from tests.conftest import FAKE_TX_HASH
+
+        mock_web3.eth.wait_for_transaction_receipt.side_effect = TimeExhausted(
+            "not in the chain after 300 seconds"
+        )
+        fn = _make_fn()
+        with pytest.raises(TransactionPendingError) as ei:
+            client._send_tx(fn)
+
+        assert ei.value.tx_hash == FAKE_TX_HASH
+        # broadcast happened exactly once — no retry of an in-flight tx
+        assert mock_web3.eth.send_raw_transaction.call_count == 1
+
+
+class TestSendTxNonceLifecycle:
+    def test_prebroadcast_429_retries_with_same_nonce(self, client, mock_web3):
+        fn = _make_fn()
+        mock_web3.eth.call.side_effect = [
+            Exception("HTTP 429: too many requests"),
+            b"",
+        ]
+
+        with patch("avaxagent.core.contract_mixin.time.sleep") as sleep:
+            result = client._send_tx(fn)
+
+        assert result["status"] == 1
+        assert mock_web3.eth.send_raw_transaction.call_count == 1
+        sleep.assert_called_once()
+        assert [call.args[0]["nonce"] for call in fn.build_transaction.call_args_list] == [
+            0,
+            0,
+        ]
+
+    def test_send_time_429_tracks_local_hash_without_rebroadcast(
+        self, client, mock_web3
+    ):
+        fn = _make_fn()
+        mock_web3.eth.send_raw_transaction.side_effect = Exception(
+            "HTTP 429: too many requests"
+        )
+
+        result = client._send_tx(fn)
+
+        assert result["status"] == 1
+        assert mock_web3.eth.send_raw_transaction.call_count == 1
+        assert mock_web3.eth.wait_for_transaction_receipt.call_count == 1
+
+
+class TestNonceTooLowResync:
+    """Audit R2 M01 regression: "nonce too low" is a deterministic rejection
+    (the tx never entered the mempool) and must re-sync + retry via
+    NonceManager.handle_error(), never be pinned BROADCAST as an ambiguous
+    send result."""
+
+    def test_nonce_too_low_is_not_ambiguous(self):
+        from avaxagent.core.contract_mixin import (
+            AMBIGUOUS_SEND_ERROR_MARKERS,
+            _is_ambiguous_send_error,
+        )
+        from avaxagent.wallets.local_executor import _is_ambiguous_broadcast_error
+
+        assert "nonce too low" not in AMBIGUOUS_SEND_ERROR_MARKERS
+        err = Exception("nonce too low: next nonce 5, tx nonce 2")
+        assert not _is_ambiguous_send_error(err)
+        assert not _is_ambiguous_broadcast_error(err)
+
+    def test_stale_local_nonce_resyncs_and_retries(self, client, mock_web3):
+        from tests.conftest import FAKE_TX_HASH
+
+        fn = _make_fn()
+        # Local view is stale (chain already at 5): seed reserve() with 2,
+        # then handle_error()'s re-sync reads 5.
+        mock_web3.eth.get_transaction_count.side_effect = [2, 5]
+        mock_web3.eth.send_raw_transaction.side_effect = [
+            Exception("nonce too low: next nonce 5, tx nonce 2"),
+            bytes.fromhex(FAKE_TX_HASH[2:]),
+        ]
+
+        result = client._send_tx(fn)
+
+        assert result["status"] == 1
+        assert mock_web3.eth.send_raw_transaction.call_count == 2
+        assert [
+            call.args[0]["nonce"] for call in fn.build_transaction.call_args_list
+        ] == [2, 5]
+        # the rejected nonce was released, not pinned BROADCAST
+        nonce_mgr = NonceManager.for_account(mock_web3, FAKE_ADDRESS)
+        assert nonce_mgr.broadcast_hash(2) is None

@@ -1,0 +1,394 @@
+"""Shared transaction sending and retry logic for web3 contract clients."""
+
+from __future__ import annotations
+
+import logging
+import os
+import time
+from typing import Any
+
+from web3 import Web3
+from web3.exceptions import ContractLogicError, TimeExhausted
+
+from ..exceptions import TransactionPendingError
+from ..networks.addresses import AVALANCHE_FUJI_CHAIN_ID, AVALANCHE_MAINNET_CHAIN_ID
+from .nonce_manager import NonceManager
+
+logger = logging.getLogger(__name__)
+
+READ_ONLY_MESSAGE = "wallet_provider is required for write operations (client is read-only)"
+
+
+# Errors after which the transaction MAY have been accepted by the node, so
+# the nonce must be pinned BROADCAST and the local hash tracked. "nonce too
+# low" must NOT be listed here: it is a deterministic rejection (the tx never
+# entered the mempool) and has to fall through to NonceManager.handle_error()
+# so the stale local nonce is re-synced from chain and the send retried.
+AMBIGUOUS_SEND_ERROR_MARKERS = (
+    "429",
+    "too many requests",
+    "timeout",
+    "timed out",
+    "connection",
+    "network",
+    "already known",
+    "replacement transaction underpriced",
+)
+
+
+def _is_ambiguous_send_error(error: Exception) -> bool:
+    text = str(error).lower()
+    return any(marker in text for marker in AMBIGUOUS_SEND_ERROR_MARKERS)
+
+
+def _raw_bytes(signed: Any) -> bytes:
+    raw = signed["rawTransaction"]
+    if isinstance(raw, str):
+        return bytes.fromhex(raw.removeprefix("0x"))
+    return bytes(raw)
+
+
+def _local_tx_hash(raw: bytes) -> tuple[bytes, str]:
+    digest = bytes(Web3.keccak(raw))
+    return digest, "0x" + digest.hex()
+
+
+MAX_RETRIES = 5
+RETRY_BASE_DELAY = 1.0
+
+# Floor for transaction gas price. ``eth_gasPrice`` on Avalanche C-Chain
+# already returns ``baseFee + suggested tip`` and the dynamic fee mechanism
+# (ACP-176) lets the base fee drop to a few wei on Fuji, so the Avalanche floor
+# is deliberately tiny: the 20% headroom applied on top of ``eth_gasPrice`` is
+# what keeps the tx above the base fee. ``MIN_GAS_PRICE_WEI`` remains the
+# conservative fallback for unknown chains (e.g. a custom Avalanche L1).
+MIN_GAS_PRICE_WEI = 100_000_000  # 0.1 Gwei — default/fallback for unknown chains
+
+_MIN_GAS_PRICE_WEI_PER_CHAIN = {
+    AVALANCHE_MAINNET_CHAIN_ID: 1,  # trust eth_gasPrice (baseFee-tracking)
+    AVALANCHE_FUJI_CHAIN_ID: 1,  # Fuji baseFee can sit at ~10 wei
+}
+_min_gas_price_override: int | None = None  # set via set_min_gas_price_wei()
+
+
+def set_min_gas_price_wei(wei: int) -> None:
+    """Pin the gas-price floor for *all* chains.
+
+    Public API (re-exported from ``avaxagent``). Overrides both the per-chain
+    defaults and the ``AVAXAGENT_MIN_GAS_PRICE_WEI`` env var; precedence is
+    ``set_min_gas_price_wei() > env > per-chain default``.
+    """
+    global _min_gas_price_override
+    if wei <= 0:
+        raise ValueError("min gas price must be positive")
+    _min_gas_price_override = int(wei)
+
+
+def min_gas_price_wei(chain_id: int) -> int:
+    """Resolve the gas-price floor (wei) for ``chain_id``.
+
+    Precedence: the :func:`set_min_gas_price_wei` override, then the
+    ``AVAXAGENT_MIN_GAS_PRICE_WEI`` env var (global, all chains), then the
+    per-chain default (``MIN_GAS_PRICE_WEI`` for unknown chains).
+    """
+    if _min_gas_price_override is not None:
+        return _min_gas_price_override
+    raw = os.environ.get("AVAXAGENT_MIN_GAS_PRICE_WEI")
+    if raw:
+        try:
+            return int(raw)
+        except ValueError:
+            logger.warning("Ignoring invalid AVAXAGENT_MIN_GAS_PRICE_WEI=%r", raw)
+    return _MIN_GAS_PRICE_WEI_PER_CHAIN.get(chain_id, MIN_GAS_PRICE_WEI)
+
+
+# Fallback gas limit used only when on-chain estimation is unavailable
+# (transport/RPC error, opaque revert data) or bypassed (skip_preflight).
+# Nodes require ``balance >= gas_limit * gasPrice`` upfront, so a blanket
+# 2M limit would demand ~0.005 AVAX per tx (25 nAVAX) while typical writes burn
+# 50-150k gas — estimation keeps the entry cost proportional to real usage.
+DEFAULT_GAS_FALLBACK = 2_000_000
+
+# Default seconds to wait for a transaction receipt. web3.py's own default
+# (120s) is too short on congested public RPC endpoints; both
+# write paths (``_send_tx`` here and ``LocalExecutor``) share this value.
+DEFAULT_RECEIPT_TIMEOUT = 300
+
+_receipt_timeout_override: int | None = None  # set via set_default_receipt_timeout()
+
+
+def set_default_receipt_timeout(seconds: int) -> None:
+    """Set the default transaction-receipt timeout (seconds) for both write paths.
+
+    Public API (re-exported from ``avaxagent``). Takes precedence over the
+    ``AVAXAGENT_RECEIPT_TIMEOUT`` env var and applies to operations executed
+    after the call — including the cached intent executor, which resolves the
+    default lazily at execute time.
+    """
+    global _receipt_timeout_override
+    if seconds <= 0:
+        raise ValueError("receipt timeout must be positive")
+    _receipt_timeout_override = int(seconds)
+
+
+def get_default_receipt_timeout() -> int:
+    """Resolve the default receipt timeout (seconds).
+
+    Precedence: the :func:`set_default_receipt_timeout` override, then the
+    ``AVAXAGENT_RECEIPT_TIMEOUT`` env var, then ``DEFAULT_RECEIPT_TIMEOUT``.
+    """
+    if _receipt_timeout_override is not None:
+        return _receipt_timeout_override
+    raw = os.environ.get("AVAXAGENT_RECEIPT_TIMEOUT")
+    if raw:
+        try:
+            return int(raw)
+        except ValueError:
+            logger.warning("Ignoring invalid AVAXAGENT_RECEIPT_TIMEOUT=%r", raw)
+    return DEFAULT_RECEIPT_TIMEOUT
+
+
+class ContractClientMixin:
+    """Shared transaction sending and retry logic for web3 contract clients.
+
+    Subclasses must set:
+        self.w3: Web3 instance
+        self._wallet_provider: WalletProvider | None  (None = read-only client)
+        self._account: str | None
+    """
+
+    def _execute_intent(self, intent) -> dict[str, Any]:
+        """Run an :class:`~avaxagent.wallets.intents.Intent` through the
+        wallet's executor.
+
+        This is the write path for clients migrated to the intent seam: the
+        wallet decides how the intent executes (a pure signer wraps itself in
+        a ``LocalExecutor``; a self-broadcasting wallet runs the semantic
+        operation itself). The executor is built lazily and cached
+        per client instance.
+        """
+        if not self._wallet_provider:
+            raise RuntimeError(READ_ONLY_MESSAGE)
+        executor = getattr(self, "_intent_executor", None)
+        if executor is None:
+            from ..wallets.intents import ExecutionContext
+
+            executor = self._wallet_provider.make_executor(ExecutionContext(web3=self.w3))
+            self._intent_executor = executor
+        return executor.execute(intent)
+
+    def _send_tx(
+        self, fn, value: int = 0, gas: int | None = None, skip_preflight: bool = False
+    ) -> dict[str, Any]:
+        """Build, sign, and send a transaction with nonce management and retry.
+
+        ``gas=None`` (default) estimates the limit on-chain with a 20% buffer
+        (mirroring erc8004's ``_execute_transaction``); pass an explicit ``gas``
+        to skip estimation.
+        """
+        if not self._wallet_provider:
+            raise RuntimeError(READ_ONLY_MESSAGE)
+
+        if gas is None:
+            gas = self._estimate_gas_limit(fn, value, skip_preflight)
+
+        # Resolve the per-chain gas-price floor once (chain_id is an RPC call).
+        try:
+            floor_wei = min_gas_price_wei(self.w3.eth.chain_id)
+        except Exception:
+            floor_wei = MIN_GAS_PRICE_WEI
+
+        nonce_mgr = NonceManager.for_account(self.w3, self._account)
+        last_error = None
+        class_name = type(self).__name__
+
+        for attempt in range(MAX_RETRIES):
+            nonce = nonce_mgr.reserve()
+            local_hash_hex: str | None = None
+            try:
+                # Fetch current gas price and add 20% buffer; floor at the
+                # per-chain minimum so a low ``eth_gasPrice`` reading on an
+                # unknown chain doesn't leave the tx stranded in mempool.
+                try:
+                    gas_price = max(int(self.w3.eth.gas_price * 1.2), floor_wei)
+                except Exception:
+                    gas_price = floor_wei
+                tx = fn.build_transaction(
+                    {
+                        "from": self._account,
+                        "nonce": nonce,
+                        "gas": gas,
+                        "gasPrice": gas_price,
+                        "value": value,
+                    }
+                )
+                # Pre-flight: simulate via eth_call to surface revert reason before spending gas.
+                # Skipped when skip_preflight=True (e.g. when node returns opaque 0x reverts).
+                if not skip_preflight:
+                    import concurrent.futures as _cf
+
+                    _call_params = {
+                        "from": self._account,
+                        "to": tx.get("to"),
+                        "data": tx.get("data", "0x"),
+                        "value": tx.get("value", 0),
+                        "gas": tx.get("gas", gas),
+                    }
+                    with _cf.ThreadPoolExecutor(max_workers=1) as _pool:
+                        _future = _pool.submit(self.w3.eth.call, _call_params)
+                        try:
+                            _future.result(timeout=10)
+                        except _cf.TimeoutError:
+                            logger.warning(
+                                f"[{class_name}] Pre-flight eth_call timed out, proceeding anyway"
+                            )
+                        except Exception as preflight_err:
+                            err_str = str(preflight_err)
+                            # Skip pre-flight if node returns opaque 0x (no revert data)
+                            if "'0x'" in err_str or err_str.strip().endswith(", '0x')"):
+                                logger.warning(
+                                    f"[{class_name}] Pre-flight returned opaque 0x revert, "
+                                    "proceeding to on-chain tx"
+                                )
+                            else:
+                                raise RuntimeError(
+                                    f"Transaction would revert: {preflight_err}"
+                                ) from preflight_err
+
+                signed = self._wallet_provider.sign_transaction(tx)
+                raw_tx = _raw_bytes(signed)
+                local_hash, local_hash_hex = _local_tx_hash(raw_tx)
+                try:
+                    tx_hash = self.w3.eth.send_raw_transaction(raw_tx)
+                except Exception as send_error:
+                    if _is_ambiguous_send_error(send_error):
+                        nonce_mgr.mark_broadcast(nonce, local_hash_hex)
+                        logger.warning(
+                            "[%s] send result is ambiguous (%s); tracking local "
+                            "tx hash %s without rebroadcast",
+                            class_name,
+                            send_error,
+                            local_hash_hex,
+                        )
+                        tx_hash = local_hash
+                    else:
+                        raise
+                else:
+                    nonce_mgr.mark_broadcast(nonce, local_hash_hex)
+                timeout = get_default_receipt_timeout()
+                try:
+                    receipt = self.w3.eth.wait_for_transaction_receipt(tx_hash, timeout=timeout)
+                except TimeExhausted as exc:
+                    # Broadcast OK (nonce consumed) but unconfirmed in time —
+                    # surface as pending with the hash, never as a fatal/retry
+                    # (a blind retry would risk a double-broadcast).
+                    tx_hash_hex = tx_hash.hex()
+                    if not tx_hash_hex.startswith("0x"):
+                        tx_hash_hex = "0x" + tx_hash_hex
+                    raise TransactionPendingError(
+                        tx_hash=tx_hash_hex, timeout_seconds=timeout
+                    ) from exc
+                if receipt["status"] == 0:
+                    nonce_mgr.mark_finalized(nonce)
+                    raise RuntimeError(
+                        f"Transaction reverted on-chain: {receipt['transactionHash'].hex()}"
+                    )
+                nonce_mgr.mark_finalized(nonce)
+                return {
+                    "transactionHash": (
+                        tx_hash.hex() if hasattr(tx_hash, "hex") else str(tx_hash)
+                    ),
+                    "status": receipt["status"],
+                    "receipt": receipt,
+                }
+            except TransactionPendingError:
+                # Broadcast succeeded; not a failure and not retryable here.
+                raise
+            except Exception as e:
+                last_error = e
+                error_str = str(e).lower()
+
+                if nonce_mgr.state_of(nonce) is not None:
+                    if nonce_mgr.broadcast_hash(nonce) is not None:
+                        raise TransactionPendingError(
+                            tx_hash=local_hash_hex or nonce_mgr.broadcast_hash(nonce) or "",
+                            timeout_seconds=get_default_receipt_timeout(),
+                            message=(
+                                f"Transaction {local_hash_hex} may be broadcast, but "
+                                f"receipt reconciliation failed: {e}. Do not rebroadcast "
+                                "until its chain status is known."
+                            ),
+                        ) from e
+                    nonce_mgr.release(nonce)
+
+                # Nonce error -> re-sync and retry
+                if nonce_mgr.handle_error(e, nonce) and attempt < MAX_RETRIES - 1:
+                    logger.warning(
+                        f"[{class_name}] Nonce error, retry {attempt + 1}/{MAX_RETRIES}"
+                    )
+                    continue
+
+                # Rate limit -> backoff and retry
+                is_rate_limit = "429" in error_str or "too many requests" in error_str
+                if is_rate_limit and attempt < MAX_RETRIES - 1:
+                    delay = RETRY_BASE_DELAY * (2**attempt)
+                    logger.warning(
+                        f"[{class_name}] Rate limited, retry {attempt + 1}/{MAX_RETRIES} "
+                        f"in {delay:.1f}s"
+                    )
+                    time.sleep(delay)
+                    continue
+
+                raise
+
+        raise last_error  # type: ignore
+
+    def _estimate_gas_limit(self, fn, value: int, skip_preflight: bool) -> int:
+        """Estimate gas for ``fn`` with a 20% buffer.
+
+        Falls back to ``DEFAULT_GAS_FALLBACK`` when estimation is unavailable —
+        transport/RPC errors, or nodes returning opaque ``0x`` revert data (the
+        same escape hatch the pre-flight uses). A genuine revert surfaced by
+        the estimation is raised as ``Transaction would revert`` so the caller
+        sees the reason instead of a masked fallback broadcast.
+        """
+        class_name = type(self).__name__
+        if skip_preflight:
+            # estimate_gas simulates the call exactly like the pre-flight does;
+            # callers that opted out of simulation get the fallback limit.
+            return DEFAULT_GAS_FALLBACK
+        try:
+            estimate = fn.estimate_gas({"from": self._account, "value": value})
+            return int(estimate * 1.2)
+        except Exception as e:
+            err_str = str(e)
+            is_opaque = "'0x'" in err_str or err_str.strip().endswith(", '0x')")
+            if isinstance(e, ContractLogicError) and not is_opaque:
+                raise RuntimeError(f"Transaction would revert: {e}") from e
+            logger.warning(
+                f"[{class_name}] Gas estimation unavailable ({e}); "
+                f"falling back to gas={DEFAULT_GAS_FALLBACK}"
+            )
+            return DEFAULT_GAS_FALLBACK
+
+    def _call_with_retry(self, fn):
+        """Call a read function with retry on rate limit."""
+        last_error = None
+        class_name = type(self).__name__
+        for attempt in range(MAX_RETRIES):
+            try:
+                return fn.call()
+            except Exception as e:
+                last_error = e
+                error_str = str(e).lower()
+                is_rate_limit = "429" in error_str or "too many requests" in error_str
+                if is_rate_limit and attempt < MAX_RETRIES - 1:
+                    delay = RETRY_BASE_DELAY * (2**attempt)
+                    logger.warning(
+                        f"[{class_name}] Rate limited (read), retry {attempt + 1}/{MAX_RETRIES} "
+                        f"in {delay:.1f}s"
+                    )
+                    time.sleep(delay)
+                else:
+                    raise
+        raise last_error  # type: ignore

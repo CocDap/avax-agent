@@ -1,0 +1,3 @@
+
+# Vendored contract ABIs (copied from ./abis by hatch_build.py)
+avaxagent/abis/

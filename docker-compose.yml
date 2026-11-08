@@ -1,0 +1,65 @@
+# Local infrastructure for avaxagent-studio.
+#   docker compose up -d postgres redis      # infra only (run apps from source)
+#   docker compose --profile apps up -d      # infra + backend processes
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: studio
+      POSTGRES_PASSWORD: studio
+      POSTGRES_DB: studio
+    ports: ["5432:5432"]
+    volumes: [pgdata:/var/lib/postgresql/data]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U studio"]
+      interval: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    ports: ["6379:6379"]
+
+  # ── Control plane ────────────────────────────────────────────────────────
+  api:
+    profiles: ["apps"]
+    build: { context: ., dockerfile: apps/backend/Dockerfile }
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000
+    environment: &backend-env
+      DATABASE_URL: postgresql+asyncpg://studio:studio@postgres:5432/studio
+      REDIS_URL: redis://redis:6379/0
+      NETWORK: avalanche-fuji
+    ports: ["8000:8000"]
+    depends_on: [postgres, redis]
+
+  # ── Data plane ───────────────────────────────────────────────────────────
+  gateway:
+    profiles: ["apps"]
+    build: { context: ., dockerfile: apps/backend/Dockerfile }
+    command: uvicorn app.data_plane.gateway.main:app --host 0.0.0.0 --port 8001
+    environment: *backend-env
+    ports: ["8001:8001"]
+    depends_on: [postgres, redis]
+
+  indexer:
+    profiles: ["apps"]
+    build: { context: ., dockerfile: apps/backend/Dockerfile }
+    command: python -m app.data_plane.indexer
+    environment: *backend-env
+    depends_on: [postgres, redis]
+
+  worker:
+    profiles: ["apps"]
+    build: { context: ., dockerfile: apps/backend/Dockerfile }
+    command: arq app.data_plane.workers.settings.WorkerSettings
+    environment: *backend-env
+    depends_on: [postgres, redis]
+
+  settler:
+    profiles: ["apps"]
+    build: { context: ., dockerfile: apps/backend/Dockerfile }
+    command: python -m app.data_plane.settler
+    environment: *backend-env
+    depends_on: [postgres, redis]
+
+volumes:
+  pgdata:
