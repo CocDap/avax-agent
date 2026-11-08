@@ -2,14 +2,14 @@
 
 ```
 ┌──────────────────────────────── FRONTEND (React + Vite + shadcn/ui) ────────────────────────────────┐
-│   Agent dashboard  ·  Marketplace  ·  Wallet / Earnings  ·  Job log          apps/frontend │
+│   Agent dashboard  ·  Marketplace  ·  Wallet / Earnings  ·  Job log          apps/frontend          │
 └──────────────────────────────────────────────┬──────────────────────────────────────────────────────┘
                                                │ REST /api/v1
 ┌──────────────────────────── CONTROL PLANE (FastAPI + avaxagent SDK) ────────────────────────────────┐
-│  Agent API          Wallet Svc               Registry Svc            Billing / Payout │
-│  config CRUD        Turnkey sub-org + policy ERC-8004 register       withdrawals, studio fee │
-│  control_plane/     control_plane/wallets    control_plane/registry  control_plane/billing │
-│  agents, jobs │
+│  Agent API          Wallet Svc               Registry Svc            Billing / Payout               │
+│  config CRUD        Turnkey sub-org + policy ERC-8004 register       withdrawals, studio fee        │
+│  control_plane/     control_plane/wallets    control_plane/registry  control_plane/billing          │
+│  agents, jobs                                                                                       │
 └───────────────┬──────────────────────────────────────────────────────────────┬──────────────────────┘
                 │                                                              │
         ┌───────▼────────┐                                            ┌────────▼────────┐
@@ -17,17 +17,17 @@
         └───────▲────────┘                                            └────────▲────────┘
                 │                                                              │ enqueue run_job
 ┌───────────────┴────────────────────────────── DATA PLANE ────────────────────┴──────────────────────┐
-│  A2A Gateway (:8001)              Chain Indexer                   Job Workers          Settle Bot │
-│  /agents/{slug}/.well-known/…     ERC-8004 identity events        LLM runs task →      ERC-8183: │
-│  /agents/{slug}/a2a               USDC Transfer → agent wallet    deliverable →        router.settle() │
-│  402 → X-PAYMENT (x402) → job     JobFunded (only if 8183 on)     storage, submit      x402: reconcile │
-│                                                                                      Storage IPFS/S3 │
+│  A2A Gateway (:8001)              Chain Indexer                   Job Workers        Settle Bot     │
+│  /agents/{slug}/.well-known/…     ERC-8004 identity events        LLM runs task →    ERC-8183:      │
+│  /agents/{slug}/a2a               USDC Transfer → agent wallet    deliverable →      router.settle()│
+│  402 → X-PAYMENT (x402) → job     JobFunded (only if 8183 on)     storage, submit    x402: reconcile│
+│                                                                                      Storage IPFS/S3│
 └──────────────────────────────────────────────┬──────────────────────────────────────────────────────┘
                                                │ RPC (gas paid in AVAX)
 ┌──────────────────────────────── Avalanche C-Chain (Fuji 43113 / Mainnet 43114) ─────────────────────┐
-│  IdentityRegistry (ERC-8004) ✅    USDC / EURC (EIP-3009) ✅    Multicall3 ✅ │
-│  AgenticCommerce · EvaluatorRouter · OptimisticPolicy (ERC-8183): ❌ studio-deployed → contracts/ │
-└──────────────────────────────────────────────────────────────────────────────────────────────────────┘
+│  IdentityRegistry (ERC-8004) ✅    USDC / EURC (EIP-3009) ✅    Multicall3 ✅                       │
+│  AgenticCommerce · EvaluatorRouter · OptimisticPolicy (ERC-8183): ❌ studio-deployed → contracts/   │
+└─────────────────────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
 ## Two settlement modes (`SettlementMode`)
